@@ -110,8 +110,13 @@ run_build :: proc(cfg: Build_Config) -> bool {
 
 	fmt.printfln("wodin: building %s...", cfg.app_name)
 
-	os.remove_all(cfg.out_dir)
 	os.make_directory(cfg.out_dir)
+
+	// Only remove the generated index.html — leave everything else in the
+	// output directory untouched so authors can place their own assets there
+	// without wodin clobbering them on each build.
+	index_path, _ := filepath.join({cfg.out_dir, "index.html"}, context.temp_allocator)
+	os.remove(index_path)
 
 	libs := collect_bindings(abs_src)
 	defer {
@@ -134,15 +139,16 @@ run_build :: proc(cfg: Build_Config) -> bool {
 	copy(build_cmd[len(base_cmd):], cfg.extra_build_args)
 	if !run_command(build_cmd) do return false
 
-	odin_js_src, found := find_odin_js()
-	if !found {
-		fmt.eprintln("wodin: error: cannot find odin.js")
-		return false
-	}
-	defer delete(odin_js_src)
-
 	odin_js_dst, _ := filepath.join({cfg.out_dir, "odin.js"}, context.temp_allocator)
-	copy_file(odin_js_src, odin_js_dst)
+	if !os.exists(odin_js_dst) {
+		odin_js_src, found := find_odin_js()
+		if !found {
+			fmt.eprintln("wodin: error: cannot find odin.js")
+			return false
+		}
+		defer delete(odin_js_src)
+		copy_file(odin_js_src, odin_js_dst)
+	}
 
 	return generate_index_html(cfg, libs[:])
 }
@@ -370,20 +376,22 @@ generate_index_html :: proc(cfg: Build_Config, libs: []Js_Binding_Lib) -> bool {
 		strings.write_string(sb, "</script>")
 	}
 
-	// build_loader emits the WASM bootstrap module script.
-	// wmi is referenced from global scope — it was declared in the bindings
-	// script above.  Only injected if LOADER_MARKER is present in the template.
+	// build_loader emits the WASM bootstrap as a plain (non-module) script.
+	// Using a regular script keeps wmi, _wodin, and odin.exports in global
+	// scope so binding callbacks can freely call odin.exports.my_proc(id).
+	// Top-level await is not available in plain scripts, so runWasm is called
+	// with .catch() for error handling instead of try/await.
+	// Only injected if LOADER_MARKER is present in the template.
 	build_loader :: proc(sb: ^strings.Builder, app_name: string) {
-		strings.write_string(sb, "<script type=\"module\">\n")
-		strings.write_string(sb, "  try {\n")
-		strings.write_string(sb, "    await odin.runWasm(\"")
+		strings.write_string(sb, "<script>\n")
+		strings.write_string(sb, "  odin.runWasm(\"")
 		strings.write_string(sb, app_name)
-		strings.write_string(sb, ".wasm\", null, _wodin, wmi);\n")
-		strings.write_string(sb, "  } catch (e) {\n")
-		strings.write_string(sb, "    const el = document.getElementById(\"wodin-error\");\n")
-		strings.write_string(sb, "    if (el) { el.style.display = \"block\"; el.textContent = String(e); }\n")
-		strings.write_string(sb, "    throw e;\n")
-		strings.write_string(sb, "  }\n")
+		strings.write_string(sb, ".wasm\", null, _wodin, wmi)\n")
+		strings.write_string(sb, "    .catch(function(e) {\n")
+		strings.write_string(sb, "      var el = document.getElementById(\"wodin-error\");\n")
+		strings.write_string(sb, "      if (el) { el.style.display = \"block\"; el.textContent = String(e); }\n")
+		strings.write_string(sb, "      throw e;\n")
+		strings.write_string(sb, "    });\n")
 		strings.write_string(sb, "</script>")
 	}
 
