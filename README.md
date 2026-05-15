@@ -156,17 +156,38 @@ You can supply your own template with `-template:<file>`. A valid template must 
 
 | Marker | Description |
 |--------|-------------|
-| `<!-- WODIN_BINDINGS -->` | Required. Replaced with `odin.js`, the bindings script, and the WASM bootstrap. |
+| `<!-- WODIN_BINDINGS -->` | Required. Replaced with `odin.js`, the bindings script, and — if `<!-- WODIN_LOADER -->` is absent — the WASM bootstrap. |
+| `<!-- WODIN_LOADER -->` | Optional. When present, the WASM bootstrap is injected here instead of at `<!-- WODIN_BINDINGS -->`, letting you control loader placement independently. |
 | `<!-- WODIN_NAME -->` | Optional. Replaced with the app name (the source directory's basename). Can appear any number of times. |
 
-A custom template might look like:
+If only `<!-- WODIN_BINDINGS -->` is present, everything is injected there and the template needs no knowledge of wodin's internals. Adding `<!-- WODIN_LOADER -->` splits the injection so authors who need custom loader placement or want to interleave their own setup code between the bindings and the bootstrap can do so:
 
 ```html
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title><!-- WODIN_NAME --> — My Game</title>
+    <title><!-- WODIN_NAME --></title>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+
+    <!-- WODIN_BINDINGS -->
+
+    <script>
+        // custom setup that runs after bindings are defined
+        // but before the wasm module is loaded
+        _wodin["canvas"].init_canvas(document.getElementById("canvas"));
+    </script>
+
+    <!-- WODIN_LOADER -->
+</body>
+</html>
+```
+
+A minimal custom template using only `<!-- WODIN_BINDINGS -->`:
+
+```html
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
