@@ -37,6 +37,7 @@ Js_Variable :: struct {
 
 INJECTION_MARKER :: "<!-- WODIN_BINDINGS -->"
 NAME_MARKER      :: "<!-- WODIN_NAME -->"
+LOADER_MARKER    :: "<!-- WODIN_LOADER -->"
 
 DEFAULT_TEMPLATE :: `<!DOCTYPE html>
 <html>
@@ -46,6 +47,7 @@ DEFAULT_TEMPLATE :: `<!DOCTYPE html>
 </head>
 <body>
     <!-- WODIN_BINDINGS -->
+    <!-- WODIN_LOADER -->
 </body>
 </html>
 `
@@ -316,91 +318,86 @@ generate_index_html :: proc(cfg: Build_Config, libs: []Js_Binding_Lib) -> bool {
 		return false
 	}
 
-	// Two-pass codegen:
+	has_loader_marker := strings.contains(s_tpl, LOADER_MARKER)
+	has_odin_js       := strings.contains(s_tpl, "odin.js")
+
+	// build_bindings emits the error div, optionally odin.js, wmi, let
+	// declarations, and the _wodin import object.  Always injected at
+	// INJECTION_MARKER.
 	//
-	// Pass 1 — emit `let` declarations for every wodin.variable, collected
-	// across all libs.  These sit at the top of the script block so that the
-	// arrow functions defined in _wodin below can close over them.
-	//
-	//   let val;        // bare wodin.variable
-	//   let val = 42;   // wodin.variable = 42
-	//
-	// They are intentionally NOT added to the _wodin import object — WASM can
-	// only import functions/memories/tables/globals, not plain JS values.
-	// The convention is that Odin-side getters/setters (tagged wodin.function)
-	// read and write these slots; the foreign variable declaration is just an
-	// annotation marking the JS variable's existence.
-	//
-	// Pass 2 — emit the _wodin import object containing only functions.
+	// wmi is declared here as `var` (global scope) rather than inside the
+	// module script, so that arrow functions in _wodin can reference it.
+	// `const`/`let` inside a type="module" script are module-scoped and
+	// invisible to everything outside it.
+	build_bindings :: proc(sb: ^strings.Builder, libs: []Js_Binding_Lib, include_odin_js: bool) {
+		strings.write_string(sb, "<div id=\"wodin-error\" style=\"display:none;color:red;font-family:monospace;padding:1em;white-space:pre-wrap;\"></div>\n")
+		if include_odin_js {
+			strings.write_string(sb, "<script src=\"odin.js\"></script>\n")
+		}
+		strings.write_string(sb, "<script>\n")
+		strings.write_string(sb, "  var wmi = new odin.WasmMemoryInterface();\n")
 
-	sb := strings.builder_make(context.temp_allocator)
-
-	// Everything Odin-related is injected at the marker — authors need no
-	// knowledge of the Odin runtime to write a compatible template.
-
-	// Error display element.
-	strings.write_string(&sb, "<div id=\"wodin-error\" style=\"display:none;color:red;font-family:monospace;padding:1em;white-space:pre-wrap;\"></div>\n")
-
-	// Odin JS runtime.
-	strings.write_string(&sb, "<script src=\"odin.js\"></script>\n")
-
-	// Bindings script: let declarations then the _wodin import object.
-	strings.write_string(&sb, "<script>\n")
-
-	// Pass 1: let declarations
-	for lib in libs {
-		for v in lib.variables {
-			strings.write_string(&sb, "  let ")
-			strings.write_string(&sb, v.name)
-			if v.value != "" {
-				strings.write_string(&sb, " = ")
-				strings.write_string(&sb, v.value)
+		for lib in libs {
+			for v in lib.variables {
+				strings.write_string(sb, "  let ")
+				strings.write_string(sb, v.name)
+				if v.value != "" {
+					strings.write_string(sb, " = ")
+					strings.write_string(sb, v.value)
+				}
+				strings.write_string(sb, ";\n")
 			}
-			strings.write_string(&sb, ";\n")
-		}
-	}
-
-	// Pass 2: _wodin import object (functions only, libs with no functions omitted)
-	strings.write_string(&sb, "  var _wodin = {\n")
-	for lib in libs {
-		if len(lib.functions) == 0 do continue
-		strings.write_string(&sb, "    \"")
-		strings.write_string(&sb, lib.import_name)
-		strings.write_string(&sb, "\": {\n")
-
-		for f in lib.functions {
-			// NOTE: never use fmt.sbprintf for JS bodies — braces in the body
-			// string are misinterpreted as format directives.
-			strings.write_string(&sb, "      ")
-			strings.write_string(&sb, f.name)
-			strings.write_string(&sb, ": (")
-			strings.write_string(&sb, f.params)
-			strings.write_string(&sb, ") => {")
-			strings.write_string(&sb, f.js_body)
-			strings.write_string(&sb, "},\n")
 		}
 
-		strings.write_string(&sb, "    },\n")
+		strings.write_string(sb, "  var _wodin = {\n")
+		for lib in libs {
+			if len(lib.functions) == 0 do continue
+			strings.write_string(sb, "    \"")
+			strings.write_string(sb, lib.import_name)
+			strings.write_string(sb, "\": {\n")
+			for f in lib.functions {
+				strings.write_string(sb, "      ")
+				strings.write_string(sb, f.name)
+				strings.write_string(sb, ": (")
+				strings.write_string(sb, f.params)
+				strings.write_string(sb, ") => {")
+				strings.write_string(sb, f.js_body)
+				strings.write_string(sb, "},\n")
+			}
+			strings.write_string(sb, "    },\n")
+		}
+		strings.write_string(sb, "  };\n")
+		strings.write_string(sb, "</script>")
 	}
-	strings.write_string(&sb, "  };\n")
-	strings.write_string(&sb, "</script>\n")
 
-	// WASM bootstrap module.
-	strings.write_string(&sb, "<script type=\"module\">\n")
-	strings.write_string(&sb, "  const wmi = new odin.WasmMemoryInterface();\n")
-	strings.write_string(&sb, "  try {\n")
-	strings.write_string(&sb, "    await odin.runWasm(\"")
-	strings.write_string(&sb, cfg.app_name)
-	strings.write_string(&sb, ".wasm\", null, _wodin, wmi);\n")
-	strings.write_string(&sb, "  } catch (e) {\n")
-	strings.write_string(&sb, "    const el = document.getElementById(\"wodin-error\");\n")
-	strings.write_string(&sb, "    if (el) { el.style.display = \"block\"; el.textContent = String(e); }\n")
-	strings.write_string(&sb, "    throw e;\n")
-	strings.write_string(&sb, "  }\n")
-	strings.write_string(&sb, "</script>")
-	
-	with_bindings, _ := strings.replace(s_tpl, INJECTION_MARKER, strings.to_string(sb), 1, context.temp_allocator)
-	output, _         := strings.replace(with_bindings, NAME_MARKER, cfg.app_name, -1, context.temp_allocator)
+	// build_loader emits the WASM bootstrap module script.
+	// wmi is referenced from global scope — it was declared in the bindings
+	// script above.  Only injected if LOADER_MARKER is present in the template.
+	build_loader :: proc(sb: ^strings.Builder, app_name: string) {
+		strings.write_string(sb, "<script type=\"module\">\n")
+		strings.write_string(sb, "  try {\n")
+		strings.write_string(sb, "    await odin.runWasm(\"")
+		strings.write_string(sb, app_name)
+		strings.write_string(sb, ".wasm\", null, _wodin, wmi);\n")
+		strings.write_string(sb, "  } catch (e) {\n")
+		strings.write_string(sb, "    const el = document.getElementById(\"wodin-error\");\n")
+		strings.write_string(sb, "    if (el) { el.style.display = \"block\"; el.textContent = String(e); }\n")
+		strings.write_string(sb, "    throw e;\n")
+		strings.write_string(sb, "  }\n")
+		strings.write_string(sb, "</script>")
+	}
+
+	bindings_sb := strings.builder_make(context.temp_allocator)
+	build_bindings(&bindings_sb, libs, !has_odin_js)
+
+	loader_sb := strings.builder_make(context.temp_allocator)
+	if has_loader_marker {
+		build_loader(&loader_sb, cfg.app_name)
+	}
+
+	with_bindings, _ := strings.replace(s_tpl, INJECTION_MARKER, strings.to_string(bindings_sb), 1, context.temp_allocator)
+	with_loader, _   := strings.replace(with_bindings, LOADER_MARKER, strings.to_string(loader_sb), 1, context.temp_allocator)
+	output, _        := strings.replace(with_loader, NAME_MARKER, cfg.app_name, -1, context.temp_allocator)
 	out_path, _ := filepath.join({cfg.out_dir, "index.html"}, context.temp_allocator)
 	write_err := os.write_entire_file(out_path, transmute([]byte)output)
 	
